@@ -22,6 +22,46 @@ from .comm.nccl_backend import NCCLBackend, OverlapMode, get_backend, init_backe
 from .overlap.manager import OverlapManager, OverlapRegion
 from .config import config
 
+# NVSHMEM backend (optional, requires NVSHMEM installation)
+try:
+    from .comm.nvshmem_backend import (
+        is_nvshmem_available,
+        init_nvshmem,
+        finalize_nvshmem,
+        nvshmem_allreduce,
+        nvshmem_all_to_all_4D,
+        nvshmem_my_pe,
+        nvshmem_n_pes,
+        nvshmem_barrier,
+    )
+    _NVSHMEM_AVAILABLE = is_nvshmem_available()
+except ImportError:
+    _NVSHMEM_AVAILABLE = False
+
+    def is_nvshmem_available():
+        return False
+
+    def init_nvshmem():
+        raise RuntimeError("NVSHMEM not available. Build extension first.")
+
+    def finalize_nvshmem():
+        pass
+
+    def nvshmem_allreduce(tensor, op="sum"):
+        raise RuntimeError("NVSHMEM not available. Build extension first.")
+
+    def nvshmem_all_to_all_4D(tensor, scatter_dim, gather_dim):
+        raise RuntimeError("NVSHMEM not available. Build extension first.")
+
+    def nvshmem_my_pe():
+        raise RuntimeError("NVSHMEM not available. Build extension first.")
+
+    def nvshmem_n_pes():
+        raise RuntimeError("NVSHMEM not available. Build extension first.")
+
+    def nvshmem_barrier():
+        raise RuntimeError("NVSHMEM not available. Build extension first.")
+
 __version__ = "0.1.0"
 __all__ = [
     # Core
@@ -58,6 +98,15 @@ __all__ = [
     "OverlapRegion",
     # Config
     "config",
+    # NVSHMEM backend
+    "is_nvshmem_available",
+    "init_nvshmem",
+    "finalize_nvshmem",
+    "nvshmem_allreduce",
+    "nvshmem_all_to_all_4D",
+    "nvshmem_my_pe",
+    "nvshmem_n_pes",
+    "nvshmem_barrier",
     # Utilities
     "init",
     "get_rank",
