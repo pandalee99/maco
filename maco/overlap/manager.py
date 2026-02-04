@@ -29,6 +29,10 @@ class OverlapManager:
 
     This manager uses separate CUDA streams for compute and communication,
     allowing them to execute concurrently when there are no data dependencies.
+
+    Supports:
+    - AllReduce + Compute overlap (Tensor Parallel)
+    - All-to-All + Compute overlap (Sequence Parallel)
     """
 
     def __init__(self, device: Optional[torch.device] = None):
@@ -57,6 +61,28 @@ class OverlapManager:
             "overlapped_time_ms": 0.0,
             "sequential_time_ms": 0.0,
         }
+
+    def get_comm_stream(self) -> Optional[torch.cuda.Stream]:
+        """Get the communication stream for manual stream management."""
+        return self.comm_stream
+
+    def get_compute_stream(self) -> Optional[torch.cuda.Stream]:
+        """Get the compute stream for manual stream management."""
+        return self.compute_stream
+
+    def sync_streams(self):
+        """Synchronize both compute and communication streams with default stream."""
+        if self.compute_stream is not None and self.comm_stream is not None:
+            # Create events to sync
+            compute_done = torch.cuda.Event()
+            comm_done = torch.cuda.Event()
+
+            compute_done.record(self.compute_stream)
+            comm_done.record(self.comm_stream)
+
+            # Wait on default stream
+            torch.cuda.current_stream().wait_event(compute_done)
+            torch.cuda.current_stream().wait_event(comm_done)
 
     @contextmanager
     def overlap_region(self):
@@ -195,34 +221,188 @@ class OverlapManager:
         if self.comm_stream is not None:
             self.comm_stream.synchronize()
 
+    def overlap_all_to_all_with_compute(
+        self,
+        all_to_all_fn: Callable,
+        compute_fn: Callable,
+    ) -> tuple:
+        """
+        Execute all_to_all communication and compute in parallel.
+
+        This is specifically designed for Sequence Parallel workloads where
+        all_to_all is used to redistribute tensors across GPUs.
+
+        Args:
+            all_to_all_fn: Function that performs all_to_all communication.
+                           Should return the result tensor.
+            compute_fn: Function to execute for compute.
+                        Should return the compute result.
+
+        Returns:
+            Tuple of (compute_result, all_to_all_result)
+
+        Example:
+            result, comm_out = manager.overlap_all_to_all_with_compute(
+                all_to_all_fn=lambda: all_to_all_4D(tensor, scatter_dim=2, gather_dim=1),
+                compute_fn=lambda: torch.matmul(a, b)
+            )
+        """
+        if self.compute_stream is None or self.comm_stream is None:
+            # Sequential fallback
+            comm_result = all_to_all_fn()
+            compute_result = compute_fn()
+            return compute_result, comm_result
+
+        # Record start event
+        start_event = torch.cuda.Event()
+        start_event.record()
+
+        # Start all_to_all on comm stream
+        comm_result = [None]
+        comm_done_event = torch.cuda.Event()
+
+        with torch.cuda.stream(self.comm_stream):
+            self.comm_stream.wait_event(start_event)
+            comm_result[0] = all_to_all_fn()
+            comm_done_event.record()
+
+        # Start compute on compute stream
+        compute_result = [None]
+        compute_done_event = torch.cuda.Event()
+
+        with torch.cuda.stream(self.compute_stream):
+            self.compute_stream.wait_event(start_event)
+            compute_result[0] = compute_fn()
+            compute_done_event.record()
+
+        # Wait for both to complete
+        comm_done_event.synchronize()
+        compute_done_event.synchronize()
+
+        return compute_result[0], comm_result[0]
+
+    def overlap_generic(
+        self,
+        comm_fn: Callable,
+        compute_fn: Callable,
+    ) -> tuple:
+        """
+        Generic overlap: execute any communication and compute in parallel.
+
+        Args:
+            comm_fn: Any communication function (allreduce, all_to_all, etc.)
+            compute_fn: Any compute function
+
+        Returns:
+            Tuple of (compute_result, comm_result)
+        """
+        return self.overlap_all_to_all_with_compute(comm_fn, compute_fn)
+
 
 class OverlapRegion:
     """
     Region where tasks can be overlapped.
 
     Usage:
+        # Method 1: submit_* API
         with manager.overlap_region() as region:
             compute_future = region.submit_compute(my_compute_fn)
             comm_future = region.submit_comm(tensor)
         # Both are synchronized when exiting the region
+
+        # Method 2: Simple comm/compute API
+        with manager.overlap_region() as region:
+            region.comm(lambda: dist.all_to_all_single(...))
+            region.compute(lambda: torch.matmul(a, b))
+        # Automatically synchronized on exit
     """
 
     def __init__(self, manager: OverlapManager):
         self.manager = manager
         self._compute_events: List[tuple] = []  # (event, result)
         self._comm_events: List[tuple] = []  # (event, tensor)
+        self._comm_results: List[Any] = []
+        self._compute_results: List[Any] = []
+
+    def comm(self, fn: Callable) -> None:
+        """
+        Execute a communication function on the comm stream.
+
+        Args:
+            fn: Any function that performs communication (allreduce, all_to_all, etc.)
+
+        Example:
+            region.comm(lambda: dist.all_to_all_single(output, input))
+        """
+        if self.manager.comm_stream is None:
+            # CPU fallback
+            result = fn()
+            self._comm_results.append(result)
+            return
+
+        event = torch.cuda.Event()
+
+        # Ensure previous ops are done
+        ready_event = torch.cuda.Event()
+        ready_event.record()
+
+        with torch.cuda.stream(self.manager.comm_stream):
+            self.manager.comm_stream.wait_event(ready_event)
+            result = fn()
+            event.record()
+
+        self._comm_events.append((event, result))
+        self._comm_results.append(result)
+
+    def compute(self, fn: Callable) -> None:
+        """
+        Execute a compute function on the compute stream.
+
+        Args:
+            fn: Any function that performs computation
+
+        Example:
+            region.compute(lambda: torch.matmul(a, b))
+        """
+        if self.manager.compute_stream is None:
+            # CPU fallback
+            result = fn()
+            self._compute_results.append(result)
+            return
+
+        event = torch.cuda.Event()
+
+        # Ensure previous ops are done
+        ready_event = torch.cuda.Event()
+        ready_event.record()
+
+        with torch.cuda.stream(self.manager.compute_stream):
+            self.manager.compute_stream.wait_event(ready_event)
+            result = fn()
+            event.record()
+
+        self._compute_events.append((event, result))
+        self._compute_results.append(result)
 
     def submit_compute(self, fn: Callable, *args, **kwargs):
-        """Submit compute task."""
+        """Submit compute task (legacy API)."""
         event, result = self.manager.submit_compute(fn, *args, **kwargs)
         self._compute_events.append((event, result))
         return _FutureResult(event, result)
 
     def submit_comm(self, tensor: torch.Tensor, op: str = "allreduce", **kwargs):
-        """Submit communication task."""
+        """Submit communication task (legacy API)."""
         event, result = self.manager.submit_comm(tensor, op, **kwargs)
         self._comm_events.append((event, result))
         return _FutureResult(event, result)
+
+    def get_comm_results(self) -> List[Any]:
+        """Get all communication results after wait_all()."""
+        return self._comm_results
+
+    def get_compute_results(self) -> List[Any]:
+        """Get all compute results after wait_all()."""
+        return self._compute_results
 
     def wait_all(self):
         """Wait for all submitted tasks."""

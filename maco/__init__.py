@@ -12,7 +12,11 @@ from typing import Optional
 
 from .core.context import Context, PersistentContext
 from .core.sm_manager import SMConfig, Role, auto_config
-from .comm.patterns import allreduce, allgather, reduce_scatter, send, recv, SUM, AVG
+from .comm.patterns import (
+    allreduce, allgather, reduce_scatter, send, recv,
+    all_to_all, all_to_all_single, all_to_all_4D,
+    SUM, AVG, MIN, MAX, PRODUCT
+)
 from .comm.scheduler import CommScheduler, CommPhase
 from .comm.nccl_backend import NCCLBackend, OverlapMode, get_backend, init_backend
 from .overlap.manager import OverlapManager, OverlapRegion
@@ -26,7 +30,7 @@ __all__ = [
     "SMConfig",
     "Role",
     "auto_config",
-    # Communication
+    # Communication - basic patterns
     "allreduce",
     "allgather",
     "reduce_scatter",
@@ -34,8 +38,16 @@ __all__ = [
     "recv",
     "CommScheduler",
     "CommPhase",
+    # Communication - all-to-all (for Sequence Parallel)
+    "all_to_all",
+    "all_to_all_single",
+    "all_to_all_4D",
+    # Reduction ops
     "SUM",
     "AVG",
+    "MIN",
+    "MAX",
+    "PRODUCT",
     # Backend
     "NCCLBackend",
     "OverlapMode",
@@ -52,6 +64,11 @@ __all__ = [
     "get_world_size",
     "is_initialized",
     "overlap_compute_and_comm",
+    "overlap_all_to_all_with_compute",
+    "overlap_region",
+    "get_comm_stream",
+    "get_compute_stream",
+    "sync_streams",
     "cleanup",
 ]
 
@@ -195,3 +212,144 @@ def cleanup():
         dist.destroy_process_group()
 
     _initialized = False
+
+
+# ============================================================================
+# New APIs for Sequence Parallel (all-to-all) overlap support
+# ============================================================================
+
+def get_comm_stream():
+    """
+    Get the communication CUDA stream.
+
+    Use this for manual stream management when you need fine-grained control.
+
+    Returns:
+        torch.cuda.Stream or None if CUDA is not available
+
+    Example:
+        comm_stream = maco.get_comm_stream()
+        with torch.cuda.stream(comm_stream):
+            dist.all_to_all_single(output, input)
+    """
+    global _overlap_manager
+    if _overlap_manager is None:
+        if not _initialized:
+            init()
+        if _overlap_manager is None:
+            return None
+    return _overlap_manager.get_comm_stream()
+
+
+def get_compute_stream():
+    """
+    Get the compute CUDA stream.
+
+    Use this for manual stream management when you need fine-grained control.
+
+    Returns:
+        torch.cuda.Stream or None if CUDA is not available
+
+    Example:
+        compute_stream = maco.get_compute_stream()
+        with torch.cuda.stream(compute_stream):
+            result = torch.matmul(a, b)
+    """
+    global _overlap_manager
+    if _overlap_manager is None:
+        if not _initialized:
+            init()
+        if _overlap_manager is None:
+            return None
+    return _overlap_manager.get_compute_stream()
+
+
+def sync_streams():
+    """
+    Synchronize both compute and communication streams with the default stream.
+
+    Call this after using manual stream management to ensure all operations
+    are complete before continuing.
+
+    Example:
+        # Manual overlap
+        with torch.cuda.stream(maco.get_comm_stream()):
+            dist.all_to_all_single(output, input)
+        with torch.cuda.stream(maco.get_compute_stream()):
+            result = torch.matmul(a, b)
+        maco.sync_streams()  # Wait for both to complete
+    """
+    global _overlap_manager
+    if _overlap_manager is not None:
+        _overlap_manager.sync_streams()
+
+
+def overlap_all_to_all_with_compute(all_to_all_fn, compute_fn):
+    """
+    Execute all-to-all communication and compute in parallel.
+
+    This is specifically designed for Sequence Parallel workloads where
+    all-to-all is used to redistribute tensors across GPUs.
+
+    Args:
+        all_to_all_fn: Function that performs all-to-all communication.
+                       Should return the result tensor.
+        compute_fn: Function to execute for compute.
+                    Should return the compute result.
+
+    Returns:
+        Tuple of (compute_result, all_to_all_result)
+
+    Example:
+        # Overlap all_to_all with matmul
+        compute_result, comm_result = maco.overlap_all_to_all_with_compute(
+            all_to_all_fn=lambda: maco.all_to_all_4D(tensor, scatter_dim=2, gather_dim=1),
+            compute_fn=lambda: torch.matmul(a, b)
+        )
+    """
+    global _overlap_manager
+
+    if _overlap_manager is None:
+        if not _initialized:
+            init()
+
+    if _overlap_manager is None:
+        # Sequential fallback
+        comm_result = all_to_all_fn()
+        compute_result = compute_fn()
+        return compute_result, comm_result
+
+    return _overlap_manager.overlap_all_to_all_with_compute(all_to_all_fn, compute_fn)
+
+
+def overlap_region():
+    """
+    Context manager for overlap region.
+
+    Within this region, submitted compute and comm tasks will be
+    executed in parallel on separate CUDA streams.
+
+    Returns:
+        OverlapRegion context manager
+
+    Example:
+        with maco.overlap_region() as region:
+            # These execute in parallel
+            region.comm(lambda: dist.all_to_all_single(output, input))
+            region.compute(lambda: torch.matmul(a, b))
+        # Both are synchronized when exiting the region
+
+        # Get results after the region
+        comm_results = region.get_comm_results()
+        compute_results = region.get_compute_results()
+    """
+    global _overlap_manager
+
+    if _overlap_manager is None:
+        if not _initialized:
+            init()
+
+    if _overlap_manager is None:
+        raise RuntimeError("MACO not initialized or CUDA not available")
+
+    return _overlap_manager.overlap_region()

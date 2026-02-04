@@ -242,6 +242,209 @@ def recv(
     return tensor
 
 
+def all_to_all(
+    input_tensor: torch.Tensor,
+    output_tensor: Optional[torch.Tensor] = None,
+    scatter_dim: int = 0,
+    gather_dim: int = 0,
+    group=None,
+    async_op: bool = False,
+) -> torch.Tensor:
+    """
+    All-to-All communication.
+
+    Each process sends a portion of its tensor to every other process
+    and receives a portion from every other process.
+
+    This is commonly used in Sequence Parallel for redistributing
+    tensors across the sequence and head dimensions.
+
+    Args:
+        input_tensor: Input tensor
+        output_tensor: Optional pre-allocated output tensor
+        scatter_dim: Dimension to scatter along
+        gather_dim: Dimension to gather along
+        group: Process group (default: world)
+        async_op: If True, return immediately with a handle
+
+    Returns:
+        Output tensor after all-to-all communication
+    """
+    import maco
+
+    if not maco.is_initialized():
+        maco.init()
+
+    world_size = maco.get_world_size()
+    if world_size == 1:
+        return input_tensor
+
+    try:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            # Split input along scatter_dim
+            input_list = list(torch.tensor_split(input_tensor, world_size, scatter_dim))
+            input_list = [t.contiguous() for t in input_list]
+
+            # Prepare output list
+            if output_tensor is not None:
+                output_list = list(torch.tensor_split(output_tensor, world_size, gather_dim))
+            else:
+                output_list = [torch.empty_like(input_list[0]) for _ in range(world_size)]
+
+            if async_op:
+                handle = dist.all_to_all(output_list, input_list, group=group, async_op=True)
+                output = torch.cat(output_list, dim=gather_dim)
+                return _AsyncHandle(output, handle)
+            else:
+                dist.all_to_all(output_list, input_list, group=group)
+                return torch.cat(output_list, dim=gather_dim).contiguous()
+    except ImportError:
+        pass
+
+    return input_tensor
+
+
+def all_to_all_single(
+    output_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
+    output_split_sizes: Optional[List[int]] = None,
+    input_split_sizes: Optional[List[int]] = None,
+    group=None,
+    async_op: bool = False,
+):
+    """
+    All-to-All Single communication (more efficient for equal-sized splits).
+
+    Args:
+        output_tensor: Pre-allocated output tensor
+        input_tensor: Input tensor
+        output_split_sizes: Split sizes for output (optional)
+        input_split_sizes: Split sizes for input (optional)
+        group: Process group
+        async_op: If True, return immediately with a handle
+
+    Returns:
+        Work handle if async_op=True, else None
+    """
+    try:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            if async_op:
+                return dist.all_to_all_single(
+                    output_tensor, input_tensor,
+                    output_split_sizes=output_split_sizes,
+                    input_split_sizes=input_split_sizes,
+                    group=group,
+                    async_op=True
+                )
+            else:
+                dist.all_to_all_single(
+                    output_tensor, input_tensor,
+                    output_split_sizes=output_split_sizes,
+                    input_split_sizes=input_split_sizes,
+                    group=group
+                )
+    except ImportError:
+        output_tensor.copy_(input_tensor)
+
+
+def all_to_all_4D(
+    input_tensor: torch.Tensor,
+    scatter_dim: int = 2,
+    gather_dim: int = 1,
+    group=None,
+) -> torch.Tensor:
+    """
+    Optimized 4D All-to-All for QKV tensors in Sequence Parallel.
+
+    This is specifically designed for the common pattern in attention:
+    - Input: [B, S/P, H, D] (sequence split across P processes)
+    - Output: [B, S, H/P, D] (heads split across P processes)
+
+    Args:
+        input_tensor: Input tensor of shape [B, S/P, H, D] or similar
+        scatter_dim: Dimension to scatter (default 2 for heads)
+        gather_dim: Dimension to gather (default 1 for sequence)
+        group: Process group
+
+    Returns:
+        Output tensor with swapped parallelism
+
+    Example:
+        # Before attention: redistribute from seq-parallel to head-parallel
+        q_head_parallel = all_to_all_4D(q_seq_parallel, scatter_dim=2, gather_dim=1)
+
+        # After attention: redistribute back from head-parallel to seq-parallel
+        out_seq_parallel = all_to_all_4D(out_head_parallel, scatter_dim=1, gather_dim=2)
+    """
+    import maco
+
+    if not maco.is_initialized():
+        maco.init()
+
+    world_size = maco.get_world_size()
+    if world_size == 1:
+        return input_tensor
+
+    try:
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            return input_tensor
+
+        if group is None:
+            world_size = dist.get_world_size()
+        else:
+            world_size = dist.get_world_size(group)
+
+        # Handle the 4D case: [B, S/P, H, D] -> [B, S, H/P, D]
+        if scatter_dim == 2 and gather_dim == 1:
+            b, shard_seq, h, d = input_tensor.shape
+            seq = shard_seq * world_size
+            shard_h = h // world_size
+
+            # Reshape for all-to-all: [B, S/P, P, H/P, D]
+            reshaped = input_tensor.reshape(b, shard_seq, world_size, shard_h, d)
+            # Transpose to [P, S/P, B, H/P, D]
+            transposed = reshaped.transpose(0, 2).contiguous()
+
+            output = torch.empty_like(transposed)
+            dist.all_to_all_single(output, transposed, group=group)
+
+            # Reshape back: [S, B, H/P, D] -> [B, S, H/P, D]
+            output = output.reshape(seq, b, shard_h, d)
+            output = output.transpose(0, 1).contiguous().reshape(b, seq, shard_h, d)
+            return output
+
+        elif scatter_dim == 1 and gather_dim == 2:
+            b, seq, shard_h, d = input_tensor.shape
+            h = shard_h * world_size
+            shard_seq = seq // world_size
+
+            # Reshape for all-to-all
+            reshaped = input_tensor.reshape(b, world_size, shard_seq, shard_h, d)
+            # Transpose to [H/P, P, S/P, B, D] then [P, H/P, S/P, B, D]
+            transposed = reshaped.transpose(0, 3).transpose(0, 1).contiguous()
+            transposed = transposed.reshape(world_size, shard_h, shard_seq, b, d)
+
+            output = torch.empty_like(transposed)
+            dist.all_to_all_single(output, transposed, group=group)
+
+            # Reshape back: [H, S/P, B, D] -> [B, S/P, H, D]
+            output = output.reshape(h, shard_seq, b, d)
+            output = output.transpose(0, 2).contiguous().reshape(b, shard_seq, h, d)
+            return output
+
+        else:
+            # Fallback to generic all_to_all
+            return all_to_all(input_tensor, scatter_dim=scatter_dim, gather_dim=gather_dim, group=group)
+
+    except ImportError:
+        pass
+
+    return input_tensor
+
+
 def _convert_op(op: ReduceOp):
     """Convert MACO ReduceOp to torch.distributed ReduceOp."""
     import torch.distributed as dist
