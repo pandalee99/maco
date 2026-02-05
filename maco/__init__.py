@@ -12,6 +12,10 @@ from typing import Optional
 
 from .core.context import Context, PersistentContext
 from .core.sm_manager import SMConfig, Role, auto_config
+
+# TaskGraph API (Phase 2)
+from .task_graph import TaskGraph, TaskNode, TaskType, OverlapGroup, TaskSchedule
+
 from .comm.patterns import (
     allreduce, allgather, reduce_scatter, send, recv,
     all_to_all, all_to_all_single, all_to_all_4D,
@@ -70,6 +74,12 @@ __all__ = [
     "SMConfig",
     "Role",
     "auto_config",
+    # TaskGraph API (Phase 2)
+    "TaskGraph",
+    "TaskNode",
+    "TaskType",
+    "OverlapGroup",
+    "TaskSchedule",
     # Communication - basic patterns
     "allreduce",
     "allgather",
