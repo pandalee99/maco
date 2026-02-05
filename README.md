@@ -23,7 +23,8 @@ MACO 是一个 PyTorch 优化框架，通过 **SM 级别任务调度** 实现计
 | **Persistent Kernel** | 单次 launch 执行多任务 | 16x 加速 |
 | **GPU Atomics** | PTX 指令实现 SM 间同步 | 1-2μs 延迟 |
 | **TaskGraph API** | 细粒度任务依赖控制 | 自动调度 |
-| **Compute-Comm Overlap** | 计算与通信并行执行 | 92% 效率 |
+| **Compute-Comm Overlap** | 计算与通信并行执行 | 1.27x 加速 |
+| **Multi-GPU NCCL** | 异步通信原语 | 4+ GPU 支持 |
 
 ## 🏗️ 架构
 
@@ -131,12 +132,15 @@ Compute-Comm Overlap:       92.2% efficiency
 ## 🧪 测试
 
 ```bash
-# 单元测试 (55 tests)
+# 单元测试 (单 GPU)
 pytest tests/ -v
 
-# 功能验证
-python3 examples/test_task_graph.py
-python3 examples/example_taskgraph_basic.py
+# 多 GPU 测试 (4x GPU)
+torchrun --nproc_per_node=4 -m pytest tests/test_comm.py -v
+torchrun --nproc_per_node=4 -m pytest tests/test_overlap.py -v
+
+# 性能验证
+torchrun --nproc_per_node=4 python examples/test_real_overlap.py
 ```
 
 ## 📁 项目结构
@@ -147,14 +151,23 @@ maco/
 │   ├── task_graph/              # Python API
 │   │   ├── __init__.py          # TaskGraph, TaskNode, TaskSchedule
 │   │   ├── runtime.py           # StreamRuntime
+│   │   ├── overlap_scheduler.py # OverlapScheduler, OverlapRuntime
 │   │   ├── exceptions.py        # Custom exceptions
 │   │   └── validation.py        # Input validation
+│   ├── comm/                    # Multi-GPU Communication (Phase 3)
+│   │   ├── __init__.py          # Module exports
+│   │   ├── process_group.py     # ProcessGroupManager
+│   │   └── nccl_ops.py          # Async NCCL operations
+│   ├── sync/                    # Synchronization Primitives (Phase 3)
+│   │   ├── __init__.py          # Module exports
+│   │   ├── signal_wait.py       # Signal-Wait, OverlapContext
+│   │   └── stream_manager.py    # StreamManager
 │   └── csrc/                    # CUDA Core
 │       ├── maco_kernel.cu       # Persistent Kernel
 │       ├── maco_worker.cuh      # Worker CTA
 │       ├── maco_scheduler.cuh   # Scheduler CTA
 │       └── maco_atoms.cuh       # GPU Atomics (PTX)
-├── tests/                       # Unit tests
+├── tests/                       # Unit tests (55+ tests)
 ├── examples/                    # Example scripts
 └── docs/                        # Documentation
 ```
@@ -163,8 +176,8 @@ maco/
 
 - [x] **Phase 1**: CUDA Core (GPU Atomics, Persistent Kernel)
 - [x] **Phase 2**: TaskGraph API + Validation + Tests
-- [ ] **Phase 3**: Model Integration (vLLM, LLM inference)
-- [ ] **Phase 4**: Advanced Features (Auto task graph, Dynamic scheduling)
+- [x] **Phase 3**: Multi-GPU Support (NCCL, Signal-Wait, Compute-Comm Overlap)
+- [ ] **Phase 4**: Model Integration (self-forcing, vLLM)
 
 ## 📚 Documentation
 
