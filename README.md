@@ -248,15 +248,6 @@ maco/
 
 本项目的 SM 调度技术学习自 [Mirage](https://github.com/mirage-project/mirage) 项目。
 
-## 引用
-
-```bibtex
-@software{maco2024,
-  title = {MACO: Multi-GPU Async Communication Optimizer},
-  year = {2024},
-  url = {https://github.com/your-org/maco}
-}
-```
 
 ## 许可证
 
