@@ -46,35 +46,57 @@ def get_env_path(name, default):
         print(f"Warning: {name}={path} does not exist")
     return path
 
-NVSHMEM_HOME = get_env_path("NVSHMEM_HOME", "/usr/local/nvshmem")
-MPI_HOME = get_env_path("MPI_HOME", "/usr")
-CUDA_HOME = get_env_path("CUDA_HOME", "/usr/local/cuda")
+# 自动检测 NVSHMEM 安装位置
+def find_nvshmem():
+    """查找 NVSHMEM 安装路径"""
+    # 优先级: 环境变量 > pip安装 > apt安装
+    candidates = [
+        # 环境变量
+        (os.environ.get("NVSHMEM_INC_PATH", ""), os.environ.get("NVSHMEM_LIB_PATH", "")),
+        # apt 安装 (CUDA 12) - 优先使用，更稳定
+        ("/usr/include/nvshmem_12", "/usr/lib/x86_64-linux-gnu/nvshmem/12"),
+        # apt 安装 (CUDA 13)
+        ("/usr/include/nvshmem_13", "/usr/lib/x86_64-linux-gnu/nvshmem/13"),
+        # pip 安装 (nvidia-nvshmem-cu12) - 有头文件兼容问题
+        ("/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/include",
+         "/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib"),
+        # 传统安装
+        ("/usr/local/nvshmem/include", "/usr/local/nvshmem/lib"),
+    ]
 
-# 路径配置
-NVSHMEM_INC = os.path.join(NVSHMEM_HOME, "include")
-NVSHMEM_LIB = os.path.join(NVSHMEM_HOME, "lib")
-MPI_INC = os.path.join(MPI_HOME, "include")
-MPI_LIB = os.path.join(MPI_HOME, "lib")
+    for inc, lib in candidates:
+        if inc and lib and os.path.exists(os.path.join(inc, "nvshmem.h")):
+            print(f"[MACO] Found NVSHMEM at: {inc}")
+            return inc, lib
 
-# 也支持从环境变量直接指定
-NVSHMEM_INC = os.environ.get("NVSHMEM_INC_PATH", NVSHMEM_INC)
-NVSHMEM_LIB = os.environ.get("NVSHMEM_LIB_PATH", NVSHMEM_LIB)
-MPI_INC = os.environ.get("MPI_INC_PATH", MPI_INC)
-MPI_LIB = os.environ.get("MPI_LIB_PATH", MPI_LIB)
+    return None, None
+
+NVSHMEM_INC, NVSHMEM_LIB = find_nvshmem()
+MPI_INC = "/usr/lib/x86_64-linux-gnu/openmpi/include"
+MPI_LIB = "/usr/lib/x86_64-linux-gnu/openmpi/lib"
+
+# Fallback MPI paths
+if not os.path.exists(MPI_INC):
+    MPI_INC = "/usr/include/openmpi"
+if not os.path.exists(MPI_LIB):
+    MPI_LIB = "/usr/lib/x86_64-linux-gnu"
 
 # 检查 NVSHMEM 是否存在
-nvshmem_header = os.path.join(NVSHMEM_INC, "nvshmem.h")
-if not os.path.exists(nvshmem_header):
-    print(f"=" * 60)
-    print(f"ERROR: NVSHMEM not found at {NVSHMEM_HOME}")
-    print(f"")
-    print(f"Please install NVSHMEM first:")
-    print(f"  1. Download from: https://developer.nvidia.com/nvshmem")
-    print(f"  2. Extract and set: export NVSHMEM_HOME=/path/to/nvshmem")
-    print(f"")
-    print(f"Or set NVSHMEM_INC_PATH and NVSHMEM_LIB_PATH directly.")
-    print(f"=" * 60)
-    # 允许 dry-run (例如 setup.py --help)
+if NVSHMEM_INC is None:
+    print("=" * 60)
+    print("ERROR: NVSHMEM not found")
+    print("Please install NVSHMEM: apt-get install nvshmem")
+    print("=" * 60)
+    if "--help" not in sys.argv and "egg_info" not in sys.argv:
+        sys.exit(1)
+    NVSHMEM_INC = "/tmp"  # Dummy for help
+
+nvshmem_header = os.path.join(NVSHMEM_INC, "nvshmem.h") if NVSHMEM_INC else ""
+if NVSHMEM_INC and not os.path.exists(nvshmem_header):
+    print("=" * 60)
+    print(f"ERROR: NVSHMEM header not found at {nvshmem_header}")
+    print("Please install NVSHMEM: apt-get install nvshmem")
+    print("=" * 60)
     if "--help" not in sys.argv and "egg_info" not in sys.argv:
         sys.exit(1)
 
@@ -91,8 +113,8 @@ EXTRA_COMPILE_ARGS = {
     "nvcc": [
         "-O3",
         "-std=c++17",
-        "-arch=sm_80",  # A100/A800
         "-gencode=arch=compute_80,code=sm_80",  # A100/A800
+        "-gencode=arch=compute_89,code=sm_89",  # L20/L40/RTX 4090 (Ada)
         "-gencode=arch=compute_90,code=sm_90",  # H100
         "-rdc=true",  # 必需: 用于 NVSHMEM 设备链接
         "-DUSE_NVSHMEM",

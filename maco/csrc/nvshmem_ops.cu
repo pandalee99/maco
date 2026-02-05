@@ -18,7 +18,6 @@
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
-#include <cuda_bf16.h>
 
 // NVSHMEM 头文件
 #include <nvshmem.h>
@@ -362,8 +361,9 @@ torch::Tensor nvshmem_allreduce_sum(torch::Tensor input) {
     int threads = 256;
     int blocks = std::min((int)((count + threads - 1) / threads), 1024);
 
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
+    // 只支持 float32 以避免 NVSHMEM 头文件兼容性问题
+    // (half/bfloat16 在 NVSHMEM 3.5 的 reduce.cuh 中有比较运算符问题)
+    AT_DISPATCH_FLOATING_TYPES(
         input.scalar_type(), "nvshmem_allreduce_sum", [&] {
             nvshmem_allreduce_sum_kernel<scalar_t><<<blocks, threads>>>(
                 output.data_ptr<scalar_t>(),
@@ -470,7 +470,6 @@ __global__ void nvshmem_all_to_all_4D_kernel(
 
     // 从缓冲区组装输出
     // 输出: [b, s_full, h_local, d]
-    int out_dim1 = dim1 * n_pes / n_pes;  // = dim1 (seq 不变)
     int out_dim2 = dim2 / n_pes;           // h/n_pes
 
     for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -542,8 +541,8 @@ torch::Tensor nvshmem_all_to_all_4D(
     int threads = 256;
     int blocks = std::min((int)((count + threads - 1) / threads), 1024);
 
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
+    // 只支持 float32 以避免 NVSHMEM 头文件兼容性问题
+    AT_DISPATCH_FLOATING_TYPES(
         input.scalar_type(), "nvshmem_all_to_all_4D", [&] {
             nvshmem_all_to_all_4D_kernel<scalar_t><<<blocks, threads>>>(
                 output.data_ptr<scalar_t>(),
